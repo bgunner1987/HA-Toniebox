@@ -649,7 +649,12 @@ class TonieboxDataUpdateCoordinator(DataUpdateCoordinator):
                 "status": payload.get("status"),
             }
             tb["battery"] = battery
-            tb["last_battery"] = battery.copy()
+            # A Toniebox going offline sends a final battery payload with all
+            # values null. Don't let that null out last_battery — keep the
+            # last known-good reading so consumers (e.g. RestoreEntity-backed
+            # sensors) don't lose it.
+            if battery.get("percent") is not None or battery.get("raw") is not None:
+                tb["last_battery"] = battery.copy()
             updated = True
 
         elif subtopic == ICI_TOPIC_ONLINE and isinstance(payload, dict):
@@ -939,62 +944,76 @@ class TonieboxDataUpdateCoordinator(DataUpdateCoordinator):
             # All three are available via GraphQL at /v2/graphql.
             try:
                 # The GraphQL API uses Relay-style pagination: each "my*" query
-                # returns a Connection type with edges[].node instead of a plain list.
-                # Field names verified via schema introspection. Content tonies use
-                # `title` + `series { name }` (there is no `name`), `lock` (not
-                # `locked`), and `languageName`. Discs use `title`/`coverImageUrl`.
-                # The Toniebox node has NO `placement` field — placement comes from
-                # ICI (see _on_ici_message), so it is not queried here.
-                gql_resp = await self.client.graphql_query("""
-                    {
-                      myContentTonies {
-                        edges {
-                          node {
-                            id
-                            householdId
-                            title
-                            imageUrl
-                            coverUrl
-                            lock
-                            languageName
-                            salesId
-                            series { name }
-                            chapters { id title seconds transcoding }
-                          }
-                        }
-                      }
-                      myDiscs {
-                        edges {
-                          node {
-                            id
-                            householdId
-                            title
-                            coverImageUrl
-                            discImageUrl
-                            lock
-                            language
-                            salesId
-                          }
-                        }
-                      }
-                    }
-                """)
-                gql_errors = gql_resp.get("errors")
-                if gql_errors:
-                    _LOGGER.debug("GraphQL returned errors: %s", gql_errors)
-                gql_data = gql_resp.get("data") or {}
-
-                def _relay_nodes(connection) -> list:
-                    """Extract node list from a Relay Connection or plain list."""
-                    if isinstance(connection, list):
-                        return connection
-                    if isinstance(connection, dict):
+                # returns a Connection type with edges[].node instead of a plain
+                # list, capped at ~100 items per page. Field names verified via
+                # schema introspection. Content tonies use `title` + `series {
+                # name }` (there is no `name`), `lock` (not `locked`), and
+                # `languageName`. Discs use `title`/`coverImageUrl`. The Toniebox
+                # node has NO `placement` field — placement comes from ICI (see
+                # _on_ici_message), so it is not queried here.
+                async def _fetch_relay_all(field: str, node_selection: str) -> list:
+                    """Fetch every node of a Relay-paginated `field` query,
+                    following pageInfo.hasNextPage until it's exhausted."""
+                    nodes: list = []
+                    cursor: str | None = None
+                    while True:
+                        resp = await self.client.graphql_query(
+                            f"""
+                                query($cursor: String) {{
+                                  {field}(first: 100, after: $cursor) {{
+                                    pageInfo {{ hasNextPage endCursor }}
+                                    edges {{ node {{ {node_selection} }} }}
+                                  }}
+                                }}
+                            """,
+                            {"cursor": cursor},
+                        )
+                        errors = resp.get("errors")
+                        if errors:
+                            _LOGGER.debug("GraphQL returned errors for %s: %s", field, errors)
+                        connection = (resp.get("data") or {}).get(field) or {}
                         edges = connection.get("edges") or []
-                        return [e["node"] for e in edges if isinstance(e, dict) and isinstance(e.get("node"), dict)]
-                    return []
+                        nodes.extend(
+                            e["node"] for e in edges
+                            if isinstance(e, dict) and isinstance(e.get("node"), dict)
+                        )
+                        page_info = connection.get("pageInfo") or {}
+                        cursor = page_info.get("endCursor")
+                        if not page_info.get("hasNextPage") or not cursor:
+                            break
+                    return nodes
+
+                content_tonies = await _fetch_relay_all(
+                    "myContentTonies",
+                    """
+                    id
+                    householdId
+                    title
+                    imageUrl
+                    coverUrl
+                    lock
+                    languageName
+                    salesId
+                    series { name }
+                    chapters { id title seconds transcoding }
+                    """,
+                )
+                discs = await _fetch_relay_all(
+                    "myDiscs",
+                    """
+                    id
+                    householdId
+                    title
+                    coverImageUrl
+                    discImageUrl
+                    lock
+                    language
+                    salesId
+                    """,
+                )
 
                 # Content Tonies
-                for tonie in _relay_nodes(gql_data.get("myContentTonies")):
+                for tonie in content_tonies:
                     if tonie.get("householdId") != hh_id:
                         continue
                     t_id = tonie.get("id", "")
@@ -1033,7 +1052,7 @@ class TonieboxDataUpdateCoordinator(DataUpdateCoordinator):
                     }
 
                 # Discs
-                for disc in _relay_nodes(gql_data.get("myDiscs")):
+                for disc in discs:
                     if disc.get("householdId") != hh_id:
                         continue
                     d_id = disc.get("id", "")
@@ -1236,7 +1255,7 @@ class TonieboxDataUpdateCoordinator(DataUpdateCoordinator):
                         "ble_color_id": box.get("bleColorId"),
                         "mac_address": box.get("macAddress"),
                         "item_id": box.get("itemId"),
-                        "last_seen": box.get("last_seen"),
+                        "last_seen": box.get("lastSeen") or box.get("last_seen"),
                         "settings_applied": box.get("settingsApplied", True),
                         "registered_at": box.get("registeredAt"),
                         # LED
