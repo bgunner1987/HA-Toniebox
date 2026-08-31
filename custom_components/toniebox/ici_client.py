@@ -52,13 +52,16 @@ class TonieboxIciClient:
     ) -> None:
         self._on_message_callback = on_message_callback
         self._loop = loop
-        self._on_auth_failed = on_auth_failed
+        # Kept as the public ``on_auth_failed`` argument for compatibility, but
+        # also used when a disconnect requires a fresh token before reconnecting.
+        self._on_token_refresh_needed = on_auth_failed
         self._client: mqtt.Client | None = None
         self._connected = False
         self._boxes: list[dict] = []
         self._user_uuid: str | None = None
         self._last_token: str | None = None
         self._auth_failed = False
+        self._token_refresh_pending = False
         self._lifecycle_lock = asyncio.Lock()
         self._lifecycle_generation = 0
 
@@ -214,13 +217,27 @@ class TonieboxIciClient:
         self._auth_failed = True
         generation = self._invalidate_lifecycle()
         await self._disconnect_generation(generation, "authentication failed")
-        if self._on_auth_failed:
-            try:
-                result = self._on_auth_failed()
-                if result is not None:
-                    await result
-            except Exception:
-                _LOGGER.debug("ICI on_auth_failed callback raised", exc_info=True)
+        await self._request_token_refresh("authentication failure")
+
+    async def _request_token_refresh(self, reason: str) -> None:
+        """Request one token refresh and let the token listener reconnect."""
+        if self._token_refresh_pending:
+            _LOGGER.debug("ICI token refresh already pending (%s)", reason)
+            return
+        if not self._on_token_refresh_needed:
+            _LOGGER.debug("ICI token refresh requested but no callback is configured")
+            return
+
+        self._token_refresh_pending = True
+        _LOGGER.debug("ICI requesting a fresh access token (%s)", reason)
+        try:
+            result = self._on_token_refresh_needed()
+            if result is not None:
+                await result
+        except Exception:
+            _LOGGER.debug("ICI token refresh callback raised", exc_info=True)
+        finally:
+            self._token_refresh_pending = False
 
     def publish_command(self, mac: str, command_type: str, payload: dict[str, Any]) -> bool:
         """Publish an app-control command to a Toniebox (QoS 1).
@@ -266,6 +283,7 @@ class TonieboxIciClient:
 
     async def _resume_after_token_refresh(self, new_token: str) -> None:
         """Resume ICI on the event loop after authentication refresh."""
+        self._token_refresh_pending = False
         self._last_token = new_token
         self._auth_failed = False
         _LOGGER.debug("ICI access token refreshed; requesting a new connection")
@@ -344,9 +362,14 @@ class TonieboxIciClient:
         if self._auth_failed or getattr(client, "_ici_auth_failed", False):
             _LOGGER.debug("ICI MQTT waiting for a refreshed access token")
             return
-        if self._last_token:
-            _LOGGER.debug("ICI MQTT scheduling reconnect after unexpected disconnect")
-            await self.reconnect(self._last_token)
+        generation = self._invalidate_lifecycle()
+        await self._disconnect_generation(
+            generation, "waiting for refreshed access token"
+        )
+        _LOGGER.debug(
+            "ICI MQTT requesting token refresh after unexpected disconnect"
+        )
+        await self._request_token_refresh("unexpected disconnect")
 
     def _on_message(self, client, userdata, msg):
         topic = msg.topic
