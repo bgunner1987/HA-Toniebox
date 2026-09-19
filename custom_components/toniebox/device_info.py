@@ -18,6 +18,28 @@ from homeassistant.helpers import device_registry as dr
 from .const import DOMAIN
 
 
+def _via_device_info(coordinator, parent_info: dict) -> dict:
+    """Link to the parent in this config entry, creating it if necessary.
+
+    Entity platforms start independently, so the parent's entities may not have
+    registered their device yet. Resolve/create the parent synchronously before
+    returning its registry ID; this also handles newly discovered households.
+    """
+    registry = dr.async_get(coordinator.hass)
+    identifier = next(iter(parent_info["identifiers"]))
+    if not hasattr(registry, "async_get_device_by_identifier"):
+        # Home Assistant versions before the config-entry-scoped registry API.
+        return {"via_device": identifier}
+
+    entry_id = coordinator.entry.entry_id
+    parent = registry.async_get_device_by_identifier(identifier, entry_id)
+    if parent is None:
+        parent = registry.async_get_or_create(
+            config_entry_id=entry_id, **parent_info
+        )
+    return {"via_device_id": parent.id}
+
+
 def household_device_info(coordinator, hh_id: str) -> dict:
     """Hub device — the Toniebox cloud household."""
     hh = coordinator.data.get("households", {}).get(hh_id, {})
@@ -51,7 +73,7 @@ def toniebox_device_info(coordinator, hh_id: str, tb_id: str) -> dict:
         "model": "Toniebox",
         "serial_number": tb_id,
         "sw_version": sw_version,
-        "via_device": (DOMAIN, f"hh_{hh_id}"),
+        **_via_device_info(coordinator, household_device_info(coordinator, hh_id)),
     }
     if mac:
         info["connections"] = {(dr.CONNECTION_NETWORK_MAC, mac.lower())}
@@ -71,7 +93,7 @@ def headphones_device_info(coordinator, hh_id: str, tb_id: str) -> dict:
         "name": f"{tb_name} Headphones",
         "manufacturer": "Boxine GmbH",
         "model": "Tonie Headphones",
-        "via_device": (DOMAIN, f"tb_{tb_id}"),
+        **_via_device_info(coordinator, toniebox_device_info(coordinator, hh_id, tb_id)),
     }
 
 
@@ -87,7 +109,7 @@ def creative_tonie_device_info(coordinator, hh_id: str, t_id: str) -> dict:
         "name": tonie.get("name", "Creative Tonie"),
         "manufacturer": "Boxine GmbH",
         "model": "Creative Tonie",
-        "via_device": (DOMAIN, f"hh_{hh_id}"),
+        **_via_device_info(coordinator, household_device_info(coordinator, hh_id)),
     }
 
 
@@ -103,7 +125,7 @@ def disc_device_info(coordinator, hh_id: str, disc_id: str) -> dict:
         "name": disc.get("name", "Content Disc"),
         "manufacturer": "Boxine GmbH",
         "model": "Content Disc",
-        "via_device": (DOMAIN, f"hh_{hh_id}"),
+        **_via_device_info(coordinator, household_device_info(coordinator, hh_id)),
     }
 
 
@@ -119,5 +141,5 @@ def content_tonie_device_info(coordinator, hh_id: str, ct_id: str) -> dict:
         "name": ct.get("name", "Content Tonie"),
         "manufacturer": "Boxine GmbH",
         "model": "Content Tonie",
-        "via_device": (DOMAIN, f"hh_{hh_id}"),
+        **_via_device_info(coordinator, household_device_info(coordinator, hh_id)),
     }
